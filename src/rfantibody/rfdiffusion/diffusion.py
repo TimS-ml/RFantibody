@@ -124,12 +124,28 @@ def get_beta_schedule(T, b0, bT, schedule_type, schedule_params={}, inference=Fa
 
 
 class EuclideanDiffuser():
-    # class for diffusing points 
+    """
+    Diffuser for backbone C-alpha coordinates in Euclidean space.
+
+    This class implements forward diffusion (noising) of protein backbone
+    translations using a Gaussian diffusion process. The diffusion follows
+    a variance schedule (linear or cosine) that progressively adds noise
+    to C-alpha coordinates over T timesteps.
+
+    The forward process: x_t = sqrt(1-beta_t) * x_{t-1} + sqrt(beta_t) * epsilon
+    where epsilon ~ N(0, I) is Gaussian noise.
+
+    Attributes:
+        T (int): Total number of diffusion timesteps
+        beta_schedule (tensor): Noise schedule beta_t for each timestep
+        alpha_schedule (tensor): 1 - beta_t for each timestep
+        alphabar_schedule (tensor): Cumulative product of alphas (for closed-form)
+    """
 
     def __init__(self,
-                 T, 
-                 b_0, 
-                 b_T, 
+                 T,
+                 b_0,
+                 b_T,
                  schedule_type='linear',
                  schedule_kwargs={},
                  ):
@@ -268,24 +284,38 @@ def read_pkl(read_path: str, verbose=False):
 
 class IGSO3():
     """
-    Class for taking in a set of backbone crds and performing IGSO3 diffusion
-    on all of them
+    Isotropic Gaussian SO(3) diffusion for protein backbone orientations.
+
+    This class implements forward diffusion (noising) of 3D rotations using the
+    IGSO(3) distribution - the heat kernel on the SO(3) rotation group. This is
+    the rotation equivalent of Gaussian diffusion in Euclidean space.
+
+    The IGSO(3) process progressively randomizes backbone orientations (N-CA-C frames)
+    over T timesteps following a geodesic path on the rotation manifold. The score
+    (gradient of log probability) is precomputed and cached for efficient sampling.
+
+    Key Operations:
+    - Forward diffusion: Sample random rotations and apply to backbone frames
+    - Score computation: Calculate gradients for reverse diffusion
+    - Reverse sampling: Denoise rotations using predicted structure
+
+    Reference: Yim et al. "SE(3) diffusion model with application to protein
+    backbone generation." arXiv:2302.02277 (2023)
     """
 
     def __init__(self, *, T, min_sigma, max_sigma, min_b, max_b,
             cache_dir, num_omega=1000, schedule="linear", L=2000):
-        """
+        """Initialize IGSO3 diffuser with variance schedule.
 
         Args:
-            T: total number of time steps
-            min_sigma: smallest allowed variance, should be at least 0.01 to maintain numerical stability.  Recommended value is 0.05.
-            max_sigma: for exponential schedule, the largest variance. Ignored for recommeded linear schedule
-            min_b: lower value of beta in Ho schedule analogue
-            max_b: upper value of beta in Ho schedule analouge
-            num_omega: discretization level in the angles across [0, pi]
-            schedule: currently only linear and exponential are supported.  The exponential schedule may be noising too slowly.
-            ]
-            L: truncation level
+            T: Total number of timesteps
+            min_sigma: Minimum variance (typically 0.05 for numerical stability)
+            max_sigma: Maximum variance for exponential schedule (ignored for linear)
+            min_b: Lower bound of beta in linear schedule (Ho et al. analogue)
+            max_b: Upper bound of beta in linear schedule
+            num_omega: Discretization resolution for angles in [0, pi]
+            schedule: Variance schedule type ("linear" or "exponential")
+            L: Truncation level for power series expansion of pdf (default 2000)
         """
         self._log = logging.getLogger(__name__)
 
@@ -860,8 +890,30 @@ class INTERP():
 
 
 class Diffuser():
-    # wrapper for yielding diffused coordinates/frames/rotamers  
+    """
+    Main diffuser class coordinating all diffusion operations.
 
+    This class orchestrates the complete forward diffusion process for protein
+    structures by combining:
+    1. Euclidean diffusion for C-alpha translations
+    2. SO(3) diffusion (IGSO3 or SLERP) for backbone orientations
+    3. Circular diffusion for chi/torsion angles
+
+    The Diffuser applies these three types of noise simultaneously to create
+    fully diffused protein structures at timestep T, which are then denoised
+    during reverse diffusion (inference).
+
+    Key Methods:
+    - diffuse_pose(): Main entry point - diffuses entire protein structure
+    - Combines outputs from three sub-diffusers into consistent coordinates
+
+    Attributes:
+        T (int): Total number of diffusion timesteps
+        eucl_diffuser (EuclideanDiffuser): Handles translation noise
+        so3_diffuser (IGSO3 or SLERP): Handles rotation noise
+        torsion_diffuser (INTERP): Handles sidechain torsion noise
+        crd_scale (float): Coordinate scaling factor (typically 0.25)
+    """
 
     def __init__(self,
                  T,
@@ -884,11 +936,28 @@ class Diffuser():
                  partial_T=None,
                  truncation_level=2000
                  ):
-        """
-        
-        Parameters:
-            truncation_level: for the igso3 numerical approximation
-            
+        """Initialize the main Diffuser with all sub-diffusers.
+
+        Args:
+            T: Total timesteps
+            b_0: Initial beta (noise level) for Euclidean diffusion
+            b_T: Final beta for Euclidean diffusion
+            min_sigma: Minimum variance for SO(3) diffusion
+            max_sigma: Maximum variance for SO(3) diffusion
+            min_b: Minimum beta for SO(3) schedule
+            max_b: Maximum beta for SO(3) schedule
+            schedule_type: Type of noise schedule ('linear', 'cosine')
+            so3_schedule_type: Schedule type for rotations
+            so3_type: Type of SO(3) diffusion ('igso3' or 'slerp')
+            chi_type: Type of torsion angle diffusion
+            crd_scale: Coordinate scaling factor (0.25 recommended)
+            aa_decode_steps: Number of steps for amino acid decoding
+            schedule_kwargs: Additional schedule parameters
+            chi_kwargs: Additional torsion diffusion parameters
+            var_scale: Variance scaling factor (default 1.0)
+            cache_dir: Directory for caching IGSO3 calculations
+            partial_T: If set, only diffuse up to this timestep
+            truncation_level: Truncation level for IGSO3 (default 2000)
         """
         #print('**********16')
         self.T = T

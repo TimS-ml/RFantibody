@@ -1,17 +1,37 @@
 """
-Inference script.
+RFdiffusion inference script for antibody CDR loop design.
 
-To run with base.yaml as the config,
+This script generates diverse antibody backbone structures by:
+1. Loading antibody framework and target antigen structures
+2. Running reverse diffusion to design CDR loops
+3. Guiding designs toward specified target hotspots
+4. Outputting structures with glycine placeholders in designed regions
 
-> python run_inference.py
+Usage Examples:
+---------------
 
-To specify a different config,
+Basic usage with base configuration:
+    python rfdiffusion_inference.py
 
-> python run_inference.py --config-name symmetry
+Design H3 loop targeting specific epitope:
+    python rfdiffusion_inference.py \
+        antibody.target_pdb=antigen.pdb \
+        antibody.framework_pdb=framework.pdb \
+        antibody.design_loops='{"H3": [10, 15]}' \
+        ppi.hotspot_res='[A100, A101, A102]' \
+        inference.num_designs=100 \
+        inference.output_prefix=outputs/design
 
-where symmetry can be the filename of any other config (without .yaml extension)
+Specify custom config file:
+    python rfdiffusion_inference.py --config-name antibody
+
+Output:
+-------
+- PDB files: {output_prefix}_{i}.pdb with designed backbones
+- TRB files: {output_prefix}_{i}.trb with metadata and metrics
+- Optional trajectory files showing diffusion process
+
 See https://hydra.cc/docs/advanced/hydra-command-line-flags/ for more options.
-
 """
 
 import os
@@ -44,11 +64,28 @@ def make_deterministic(seed=0):
 
 @hydra.main(version_base=None, config_path='config/inference', config_name='base')
 def main(conf: HydraConfig) -> None:
+    """Main entry point for RFdiffusion antibody design.
+
+    This function orchestrates the complete antibody design workflow:
+    1. Initialize AbSampler with model and configuration
+    2. For each design:
+        a. Run sample_init() to set up initial diffused state
+        b. Run reverse diffusion loop (T → 1) with sample_step()
+        c. Compute hotspot targeting metrics
+        d. Write output PDB and metadata files
+
+    Args:
+        conf: Hydra configuration object with all parameters
+            - inference: num_designs, output_prefix, etc.
+            - antibody: target_pdb, framework_pdb, design_loops
+            - ppi: hotspot_res for guided design
+            - diffuser: T (timesteps), noise schedules
+    """
     log = logging.getLogger(__name__)
     if conf.inference.deterministic:
         make_deterministic()
-    
-    # Initialize sampler and target/contig.
+
+    # Initialize AbSampler: loads model, sets up diffuser, parses config
     sampler = model_runners.AbSampler(conf)
     
     # Loop over number of designs to sample.

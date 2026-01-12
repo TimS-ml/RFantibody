@@ -13,11 +13,32 @@ import rfantibody.rf2.modules.pose_util as pu
 
 class AbPredictor(Predictor):
     """
-    Subclass of RF2 Predictor class, to predict Ab structures
+    Antibody structure predictor based on RoseTTAFold2.
+
+    This class extends the base RF2 Predictor to handle antibody-target complexes.
+    It runs structure prediction with recycling and computes confidence metrics
+    for filtering RFdiffusion designs.
+
+    Key Features:
+    - Structure prediction with recycling (default 10 cycles)
+    - Confidence metrics: pLDDT, pAE for quality assessment
+    - RMSD calculation between design and prediction
+    - Selects best recycling cycle based on pLDDT
+
+    Attributes:
+        conf: Hydra configuration object
+        preprocess_fn: Function to convert Pose to network inputs
+        device: torch.device for computation
+        model: RoseTTAFoldModule neural network
+        return_rmsds: Whether to compute RMSDs vs. input
     """
     def __init__(self, conf: HydraConfig, preprocess_fn: Preprocess, device='cuda:0'):
-        """
-        Initialise from config
+        """Initialize predictor with configuration.
+
+        Args:
+            conf: Hydra config containing model, inference, and output settings
+            preprocess_fn: Preprocessing function (pose_to_inference_RFinput)
+            device: Device for computation (default 'cuda:0')
         """
         self.conf=conf
         self.preprocess_fn=preprocess_fn
@@ -28,8 +49,23 @@ class AbPredictor(Predictor):
         self.xyz_converter.to(self.device)
 
     def __call__(self, pose: Pose, tag: str) -> None:
-        """
-        Runs prediction on a yielded pose
+        """Run structure prediction with recycling on an antibody-target pose.
+
+        This method implements the core prediction loop:
+        1. Preprocess pose into network inputs
+        2. Run multiple recycling cycles (default 10)
+        3. Track metrics for each cycle
+        4. Select best cycle based on pLDDT
+        5. Write output with confidence scores
+
+        Args:
+            pose: Input Pose object with antibody-target structure
+            tag: Identifier string for output files
+
+        Process:
+            - Each recycling cycle uses previous predictions as input
+            - Best cycle selected by highest mean pLDDT
+            - Outputs include: coordinates, pLDDT, pAE, optional RMSD
         """
         (    
                 network_input,

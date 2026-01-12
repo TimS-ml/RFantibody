@@ -33,11 +33,32 @@ REF_ANGLES   = rfantibody.rfdiffusion.util.reference_angles
 
 
 class Sampler:
+    """
+    Base sampler class for RFdiffusion inference.
+
+    This class handles the core diffusion-based protein design process, including:
+    - Loading pre-trained RoseTTAFold models
+    - Managing diffusion schedules and denoising
+    - Running reverse diffusion to generate protein structures
+
+    The sampler coordinates between multiple components:
+    - RoseTTAFoldModule: The neural network model
+    - Diffuser: Manages forward/reverse diffusion of coordinates and orientations
+    - Denoiser: Handles the denoising step at each timestep
+    - PotentialManager: Applies guiding potentials during sampling
+
+    Attributes:
+        model: The loaded RoseTTAFoldModule neural network
+        diffuser: Diffuser object for coordinate/orientation diffusion
+        seq_diffuser: Optional sequence diffusion module
+        device: torch.device for computation (CPU or CUDA)
+        T: Total number of diffusion timesteps
+    """
 
     def __init__(self, conf: DictConfig):
         """Initialize sampler.
         Args:
-            conf: Configuration.
+            conf: Hydra configuration object containing all inference parameters.
         """
         self.initialized = False
         self.initialize(conf)
@@ -286,74 +307,157 @@ class Sampler:
         return iu.Denoise(**denoise_kwargs)
 
     def sample_init(self, return_forward_trajectory=False):
-        """Initial features to start the sampling process.
-        
-        Modify signature and function body for different initialization
-        based on the config.
-        
+        """Initialize the starting state for reverse diffusion sampling.
+
+        This method sets up the initial coordinates and sequence at timestep T (fully noised).
+        Subclasses implement specific initialization logic:
+        - AbSampler: Initialize antibody framework + random CDR loops
+        - Standard Sampler: Initialize from contig map
+
+        The initialization involves:
+        1. Loading/constructing the input structure
+        2. Running forward diffusion to timestep T
+        3. Masking designed regions in the sequence
+
+        Args:
+            return_forward_trajectory: If True, return the full forward diffusion trajectory
+
         Returns:
-            xt: Starting positions with a portion of them randomly sampled.
-            seq_t: Starting sequence with a portion of them set to unknown.
+            xt: (L, 14, 3) Starting backbone coordinates at timestep T (fully noised)
+            seq_t: (L, 22) Starting sequence one-hot, with designed regions masked (token 21)
         """
 
         raise NotImplementedError('This function should be implemented in a subclass')
 
     def _preprocess(self, seq, xyz_t, t, repack=False):
-        
+        """Prepare all input features for the RoseTTAFold model at timestep t.
+
+        This method converts the current structure and sequence state into the
+        feature tensors required by the RoseTTAFoldModule network. Features are
+        divided into time-dependent and time-invariant components.
+
+        Input shapes:
+            seq: (L, 22) one-hot encoded sequence with mask token
+            xyz_t: (L, 14, 3) current backbone coordinates (diffused)
+            t: int, current timestep (1 to T)
+
+        Output feature tensors:
+            msa_masked: (1, 1, L, 48) MSA features with positional encoding
+            msa_full: (1, 1, L, 25) Full MSA track (single sequence)
+            seq: (1, L, 22) Sequence one-hot for network input
+            xyz_t: (1, L, 14, 3) Template coordinates
+            idx_pdb: (1, L) Residue indices with chain breaks
+            t1d: (1, L, 23+) 1D features per residue:
+                - Sequence one-hot (22 dims: 20 AAs + gap + mask)
+                - Global timestep: (1-t/T) for designed regions, 1 for fixed (1 dim)
+                - Hotspot indicator (1 dim)
+                - Optional: SS prediction, chi angle timestep
+            t2d: (1, L, L, 44+) Pairwise 2D features:
+                - Distance-based RBF features
+                - Orientation features (sin/cos of angles)
+                - Self-conditioning structure (from previous step prediction)
+                - Block adjacency matrix (last channel)
+
+        Args:
+            seq: (L, 22) Current sequence state
+            xyz_t: (L, 14, 3) Current structure state
+            t: Current timestep
+            repack: Whether this is a repack step
+
+        Returns:
+            Tuple of feature tensors ready for model forward pass
         """
-        Function to prepare inputs to diffusion model
-        
-            seq (L,22) one-hot sequence 
-
-            msa_masked (1,1,L,48)
-
-            msa_full (1,1,L,25)
-        
-            xyz_t (L,14,3) template crds (diffused) 
-
-            t1d (1,L,28) this is the t1d before tacking on the chi angles:
-                - seq + unknown/mask (21)
-                - global timestep (1-t/T if not motif else 1) (1)
-                - contacting residues: for ppi. Target residues in contact with biner (1)
-                - chi_angle timestep (1)
-                - ss (H, E, L, MASK) (4)
-            
-            t2d (1, L, L, 45)
-                - last plane is block adjacency
-    """
         raise NotImplementedError('This function should be implemented in a subclass')
 
         
     def sample_step(self, *, t, seq_t, x_t, seq_init, final_step, return_extra=False):
-        '''Generate the next pose that the model should be supplied at timestep t-1.
+        '''Execute one reverse diffusion step from timestep t to t-1.
+
+        This is the core sampling loop that:
+        1. Preprocesses inputs into model features
+        2. Runs the RoseTTAFold model forward pass
+        3. Predicts the denoised structure (px0)
+        4. Samples the sequence via autoregressive decoding
+        5. Updates coordinates for the next timestep using the denoiser
+
+        The method implements:
+        - Self-conditioning: Uses previous step's prediction to inform current step
+        - Sequence masking: Only designs specified regions
+        - Structure alignment: Keeps motif regions fixed
 
         Args:
-            t (int): The timestep that has just been predicted
-            seq_t (torch.tensor): (L,22) The sequence at the beginning of this timestep
-            x_t (torch.tensor): (L,14,3) The residue positions at the beginning of this timestep
-            seq_init (torch.tensor): (L,22) The initialized sequence used in updating the sequence.
-            
+            t (int): Current timestep (counting down from T to 1)
+            seq_t (torch.tensor): (L, 22) Sequence state at timestep t
+            x_t (torch.tensor): (L, 14, 3) Backbone coordinates at timestep t
+            seq_init (torch.tensor): (L, 22) Initial sequence (motif regions fixed)
+            final_step (int): When to stop diffusion (usually 1)
+            return_extra (bool): Whether to return additional debug info
+
         Returns:
-            px0: (L,14,3) The model's prediction of x0.
-            x_t_1: (L,14,3) The updated positions of the next step.
-            seq_t_1: (L,22) The updated sequence of the next step.
-            tors_t_1: (L, ?) The updated torsion angles of the next  step.
-            plddt: (L, 1) Predicted lDDT of x0.
+            px0: (L, 14, 3) Model's prediction of the final denoised structure
+            x_t_1: (L, 14, 3) Updated coordinates for timestep t-1
+            seq_t_1: (L, 22) Updated sequence for timestep t-1
+            tors_t_1: (L, 10, 2) Updated torsion angles for timestep t-1
+            plddt: (L,) Per-residue predicted lDDT confidence scores
         '''
 
         raise NotImplementedError('This function should be implemented in a subclass')
 
 class AbSampler(Sampler):
-    '''
+    '''Antibody-specific sampler for designing CDR loops with RFdiffusion.
+
+    This class extends the base Sampler to handle antibody-target complex design:
+    - Parses HLT format PDBs (Heavy, Light, Target chains)
+    - Identifies and designs specific CDR loops (H1, H2, H3, L1, L2, L3)
+    - Supports hotspot-guided design targeting specific epitope residues
+    - Implements antibody-specific self-conditioning schemes
+
+    Key Features:
+    1. CDR Loop Design: Flexible loop length sampling and design
+    2. Framework Conservation: Maintains constant antibody framework
+    3. Hotspot Targeting: Guides CDR loops toward specified target residues
+    4. Partial Diffusion: Can refine existing CDR designs
+
+    Attributes:
+        pose (AbPose): Antibody-target complex structure handler
+        ab_item (Dotdict): Contains antibody-specific metadata:
+            - loop_mask: Boolean mask of CDR positions being designed
+            - target_mask: Boolean mask of target chain positions
+            - hotspots: Target residue positions to target
+            - interchain_mask: Mask for interface residues
+        loop_map (dict): Maps CDR names (H1, H2, etc.) to residue indices
+        binderlen (int): Length of antibody binder region (H+L chains)
     '''
 
     def ab_design(self):
+        """Flag indicating this is an antibody design sampler."""
         return True
 
     def sample_init(self):
-        '''
-        We should do some autodetection of Ab chain in this function. The chain which we are designing is the Ab chain
-        We should also enforce the H,L,T chain labelling
+        '''Initialize antibody-target complex for diffusion sampling.
+
+        This method sets up the antibody design problem by:
+        1. Parsing the input PDB structure(s) in HLT format
+        2. Adjusting CDR loop lengths if specified
+        3. Identifying which residues to design
+        4. Running forward diffusion to timestep T
+        5. Masking CDR loop sequences
+
+        The method handles two input modes:
+        - Single HLT PDB: Complete antibody-target complex
+        - Separate framework + target PDBs: Assembled during initialization
+
+        Process Flow:
+        1. Parse input structure(s) into AbPose object
+        2. Adjust CDR loop lengths (insert/delete residues)
+        3. Create design masks (which loops to design)
+        4. Parse target hotspot residues
+        5. Run forward diffusion on binder region
+        6. Mask CDR loop sequences (set to unknown token 21)
+
+        Returns:
+            xT: (L, 14, 3) Fully diffused backbone coordinates at timestep T
+            seq_T: (L, 22) Sequence one-hot with CDR loops masked
         '''
 
         #### 1) Parse pdb to an ab_pose that can be easily manipulated
@@ -463,8 +567,12 @@ class AbSampler(Sampler):
 
         t_list = np.arange(1, self.t_step_input+1)
 
-        #### 6) Diffuse the contig mapped regions
+        #### 6) Diffuse the CDR loop regions to timestep T
         #############################################
+        # Run forward diffusion on the binder (antibody) region
+        # - Framework and target remain fixed (diffusion_mask=True)
+        # - CDR loops are progressively noised (diffusion_mask=False)
+        # Returns coordinates at all timesteps 1..T
         fa_stack, _, _ = self.diffuser.diffuse_pose(
             self.ab_item.inputs.xyz_true,
             self.ab_item.inputs.seq_true,
@@ -474,13 +582,16 @@ class AbSampler(Sampler):
             diffuse_sidechains=self.preprocess_conf.sidechain_input,
             include_motif_sidechains=self.preprocess_conf.motif_sidechain_input)
 
+        # Extract backbone coordinates at final timestep T (fully noised)
         xT = torch.clone(fa_stack[-1].squeeze()[:,:14])
 
         #### 7) Mask the input sequence of the CDR loops
         ####################################################
+        # Convert sequence to one-hot encoding
         seq_T = nn.one_hot(self.ab_item.inputs.seq_true, num_classes=22).float()
-        seq_T[~self.mask_seq,:20] = 0
-        seq_T[~self.mask_seq,21]  = 1 # Mask token
+        # Zero out CDR loop sequences and set to mask token (21)
+        seq_T[~self.mask_seq,:20] = 0  # Zero out all amino acid channels
+        seq_T[~self.mask_seq,21]  = 1  # Set mask token channel to 1
 
         self.denoiser = self.construct_denoiser(self.L, visible=self.diffusion_mask)
 
