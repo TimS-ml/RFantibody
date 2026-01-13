@@ -1,3 +1,17 @@
+"""
+File parsers for biological structure and sequence formats.
+
+This module provides parsers for various biological data formats commonly used in
+protein structure prediction and antibody design:
+    - A3M files (multiple sequence alignments)
+    - PDB files (protein structure coordinates)
+    - Chothia-numbered antibody structures
+    - HLT format (Heavy-Light-Target antibody complexes)
+    - Template structures for homology modeling
+
+The parsers extract atomic coordinates, sequence information, chain assignments,
+and antibody-specific features like CDR loop definitions.
+"""
 import os
 import re
 
@@ -13,17 +27,37 @@ import pandas as pd
 
 from rfantibody.rfdiffusion.chemical import aa2num, aa2long
 
-
+# Mapping from 3-letter amino acid codes to 1-letter codes
 to1letter = {
     "ALA":'A', "ARG":'R', "ASN":'N', "ASP":'D', "CYS":'C',
     "GLN":'Q', "GLU":'E', "GLY":'G', "HIS":'H', "ILE":'I',
     "LEU":'L', "LYS":'K', "MET":'M', "PHE":'F', "PRO":'P',
     "SER":'S', "THR":'T', "TRP":'W', "TYR":'Y', "VAL":'V' }
 
-# read A3M and convert letters into
-# integers in the 0..20 range,
-# also keep track of insertions
 def parse_a3m(filename):
+    """
+    Parse A3M multiple sequence alignment file.
+
+    Reads an A3M format MSA file and converts sequences to integer representation.
+    Tracks insertions (lowercase letters in A3M format) separately from aligned
+    positions (uppercase letters and gaps).
+
+    The A3M format is commonly used in protein structure prediction tools like
+    HHblits/HHsearch. Lowercase letters indicate insertions relative to the query.
+
+    Args:
+        filename: Path to A3M file (can be gzipped with .gz extension)
+
+    Returns:
+        msa: Multiple sequence alignment as integer array, shape (N_seqs, L)
+             Amino acids mapped to 0-19, gaps to 20
+        ins: Insertion counts at each position, shape (N_seqs, L)
+             Number of inserted residues after each aligned position
+
+    Note:
+        Limits MSA to first 10,000 sequences for memory efficiency.
+        Unknown amino acids are treated as gaps (index 20).
+    """
 
     msa = []
     ins = []
@@ -90,15 +124,58 @@ def parse_a3m(filename):
     return msa,ins
 
 
-# read and extract xyz coords of N,Ca,C atoms
-# from a PDB file
+def parse_pdb(filename, xyz27=False, seq=False):
+    """
+    Parse PDB file and extract atomic coordinates.
 
-def parse_pdb(filename, xyz27=False,seq=False):
+    Wrapper for parse_pdb_lines that reads file and passes lines to parser.
+
+    Args:
+        filename: Path to PDB file
+        xyz27: If True, return 27-atom representation (includes hydrogens),
+               otherwise return 14-atom representation (default: False)
+        seq: If True, also return sequence information (default: False)
+
+    Returns:
+        If seq=False: (xyz, mask, idx_s)
+        If seq=True: (xyz, mask, idx_s, seq)
+        Where:
+            xyz: Atomic coordinates, shape (L, 14 or 27, 3)
+            mask: Boolean mask for present atoms, shape (L, 14 or 27)
+            idx_s: Residue numbers from PDB file, shape (L,)
+            seq: Amino acid sequence as indices, shape (L,)
+    """
     lines = open(filename,'r').readlines()
     return parse_pdb_lines(lines, xyz27, seq)
 
-#'''
 def parse_pdb_lines(lines, xyz27, seq, get_aa=util.aa2num.get):
+    """
+    Parse PDB file lines and extract atomic coordinates.
+
+    Extracts backbone and side-chain atoms from PDB ATOM records. Handles both
+    14-atom (heavy atoms only) and 27-atom (with hydrogens) representations.
+
+    Args:
+        lines: List of PDB file lines
+        xyz27: If True, extract 27 atoms (with hydrogens), else 14 atoms (heavy only)
+        seq: If True, return sequence information
+        get_aa: Function to map 3-letter AA codes to indices (default: util.aa2num.get)
+
+    Returns:
+        If seq=False: (xyz, mask, idx_s)
+        If seq=True: (xyz, mask, idx_s, seq)
+        Where:
+            xyz: Atomic coordinates, shape (L, 14 or 27, 3)
+                 Missing atoms filled with 0.0
+            mask: Boolean mask indicating present atoms, shape (L, 14 or 27)
+            idx_s: Residue numbers from PDB file, shape (L,)
+            seq: Amino acid sequence as integer indices, shape (L,)
+                 Unknown residues mapped to index 20
+
+    Note:
+        Only processes ATOM records. Uses CA atoms to identify residues.
+        Atom order follows aa2long definition from chemical module.
+    """
 
     # indices of residues observed in the structure
     idx_s = [int(l[22:26]) for l in lines if l[:4]=="ATOM" and l[12:16].strip()=="CA"]
@@ -298,14 +375,39 @@ def HLT_pdb_parser(path):
     return out
 
 def chothia_pdb_parser(path, summary_path=None, chains=None, expanded_loop_def=False, rand_loop_ext=0):
-    '''
-    inputs:
-        - path | string of path to chothia labeled pdb
-        - path to summary file (optional)
-    outputs:
-        - out | dictionary including, xyz, seq, pdb_idx, cdr_bool
-    Adapted from Jake's parser. cdr_bool is now for *all* Ab chains in a pdb file
-    '''
+    """
+    Parse Chothia-numbered antibody PDB file.
+
+    Parses antibody structures using the Chothia numbering scheme, which is a
+    standardized numbering system for antibodies that aligns structurally equivalent
+    positions. Identifies CDR (Complementarity Determining Region) loops based on
+    Chothia definitions.
+
+    Standard Chothia CDR definitions:
+        L1: 24-34, L2: 50-56, L3: 89-97
+        H1: 26-32, H2: 52-56, H3: 95-102
+
+    Args:
+        path: Path to Chothia-numbered PDB file
+        summary_path: Optional path to SAbDab summary TSV file for chain identification
+                      (default: looks in standard database locations)
+        chains: Optional dict with 'H' and 'L' keys specifying heavy/light chain IDs
+        expanded_loop_def: If True, expand CDR definitions by 3 residues on each side
+        rand_loop_ext: If >0, randomly extend each CDR by 0 to rand_loop_ext residues
+
+    Returns:
+        Dictionary containing:
+            xyz: Atomic coordinates, shape (L, 27, 3)
+            mask: Boolean mask for present atoms, shape (L, 27)
+            idx: Residue numbers from PDB, shape (L,)
+            seq: Amino acid sequence as indices, shape (L,)
+            pdb_idx: List of (chain, residue_number) tuples, length L
+            cdr_bool: Boolean list indicating CDR residues, length L
+
+    Note:
+        Adapted from Jake's parser. Handles multiple antibody chains in a PDB file.
+        Uses SAbDab database to identify heavy and light chains if not specified.
+    """
 
     with open(path,'r') as f:
         lines = f.readlines()
@@ -414,14 +516,31 @@ def split_remark(line):
 
 def parse_HLT_remarked(pdb_path, preserve_pdb_numbering=False):
     """
-    New parser that also reads lines prefixed with 'REMARK PDBinfo-LABEL'
-    and gets the cdr_bool from this
-    Inputs:
-        path to pdb file.
-        Must be in H,L,T format.
-        No other chains
-    Outputs:
-        pdb object in the same format as chothia_pdb_parser
+    Parse HLT (Heavy-Light-Target) format antibody PDB with REMARK labels.
+
+    Parses antibody-target complexes in HLT format where CDR loops are identified
+    by REMARK lines rather than Chothia numbering. REMARK lines have format:
+    'REMARK PDBinfo-LABEL:   <resnum> <loop_name>'
+
+    The HLT format ensures consistent ordering: Heavy chain, Light chain, then Target.
+
+    Args:
+        pdb_path: Path to HLT format PDB file with REMARK labels
+        preserve_pdb_numbering: If False (default), renumber residues to be 1-indexed
+                                per chain. If True, keep original PDB numbering.
+
+    Returns:
+        Dictionary containing:
+            xyz: Atomic coordinates, shape (L, 27, 3)
+            mask: Boolean mask for present atoms, shape (L, 27)
+            idx: Residue numbers, shape (L,)
+            seq: Amino acid sequence as indices, shape (L,)
+            pdb_idx: List of (chain, residue_number) tuples, length L
+            cdr_bool: Boolean list indicating CDR residues (from REMARK labels), length L
+
+    Note:
+        Must be in H,L,T format with no other chains.
+        CDR definitions come from REMARK lines, not Chothia numbering.
     """
     lines = open(pdb_path,'r').readlines()
     return parse_HLT_lines(lines, preserve_pdb_numbering)

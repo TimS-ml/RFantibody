@@ -1,3 +1,18 @@
+"""
+Utility functions for protein structure manipulation and geometric calculations.
+
+This module provides a comprehensive suite of utilities for working with protein structures
+in RFdiffusion, including:
+    - Geometric transformations (rigid body motions, frames, rotations)
+    - Protein coordinate manipulation (Cbeta generation, centering, alignment)
+    - Torsion angle calculations (backbone and side-chain dihedrals)
+    - Structure I/O (PDB reading/writing)
+    - Contact and interaction analysis (hotspots, disulfides)
+    - Diffusion-specific utilities (timestep calculations)
+
+The functions use PyTorch tensors for efficient GPU computation and are designed
+to work with both batch and single-structure inputs.
+"""
 import torch
 import numpy as np
 
@@ -8,141 +23,377 @@ from rfantibody.rfdiffusion.chemical import *
 from rfantibody.rfdiffusion.scoring import *
 
 class Dotdict(dict):
-    """dot.notation access to dictionary attributes"""
+    """
+    Dictionary with dot notation access to attributes.
+
+    Allows accessing dictionary keys as attributes, e.g., d.key instead of d['key'].
+    This provides cleaner syntax for configuration objects and parameter dictionaries.
+
+    Example:
+        >>> d = Dotdict({'a': 1, 'b': 2})
+        >>> d.a
+        1
+        >>> d.c = 3
+        >>> d['c']
+        3
+    """
     __getattr__ = dict.get
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
 
+# Alphabet for Chothia numbering and chain ID conversion
 alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
 def generate_Cbeta(N,Ca,C):
-    # recreate Cb given N,Ca,C
-    b = Ca - N 
-    c = C - Ca
-    a = torch.cross(b, c, dim=-1)
-    #Cb = -0.58273431*a + 0.56802827*b - 0.54067466*c + Ca
-    # fd: below matches sidechain generator (=Rosetta params)
+    """
+    Generate Cbeta coordinates from backbone atoms N, CA, and C.
+
+    For glycine (which lacks a real Cbeta), this function generates a "pseudo-Cbeta"
+    at the ideal position. Uses Rosetta's ideal geometry parameters.
+
+    The Cbeta is constructed using a linear combination of vectors derived from the
+    backbone geometry:
+        a = (CA-N) × (C-CA)  [normal to the peptide plane]
+        b = CA - N
+        c = C - CA
+        CB = -0.579*a + 0.569*b - 0.544*c + CA
+
+    Args:
+        N: N atom coordinates, shape (..., 3)
+        Ca: CA atom coordinates, shape (..., 3)
+        C: C atom coordinates, shape (..., 3)
+
+    Returns:
+        Cbeta coordinates with same shape as input (..., 3)
+
+    Note:
+        Coefficients match Rosetta's sidechain generator parameters for consistency.
+    """
+    b = Ca - N  # Vector from N to CA
+    c = C - Ca  # Vector from CA to C
+    a = torch.cross(b, c, dim=-1)  # Normal to the peptide plane
+
+    # Ideal Cbeta position using Rosetta parameters
+    # (Earlier version used slightly different coefficients: -0.583, 0.568, -0.541)
     Cb = -0.57910144*a + 0.5689693*b - 0.5441217*c + Ca
 
     return Cb
 
 def center_and_realign_missing(xyz, mask_t):
-    # xyz: (L, 27, 3)
-    # mask_t: (L, 27)
+    """
+    Center structure at origin and realign missing residues to nearest valid residues.
+
+    This function performs two operations:
+    1. Centers the structure by moving the center of mass of CA atoms to the origin
+    2. Moves missing/invalid residues to the position of their nearest valid residue
+
+    This is useful for handling partially resolved structures or masked regions during
+    diffusion, ensuring that all residues have reasonable coordinates.
+
+    Args:
+        xyz: Atomic coordinates, shape (L, 27, 3) where L is sequence length,
+             27 is max atoms per residue, 3 is xyz coordinates
+        mask_t: Atom mask indicating valid atoms, shape (L, 27)
+                True where atom exists, False otherwise
+
+    Returns:
+        Centered and realigned coordinates, same shape as input (L, 27, 3)
+
+    Note:
+        A residue is considered valid if all backbone atoms (N, CA, C) are present.
+    """
     L = xyz.shape[0]
     assert L > 0
     assert mask_t.shape[0] == L
-    mask = mask_t[:,:3].all(dim=-1) # True for valid atom (L)
 
-    # center c.o.m at the origin
-    center_CA = (mask[...,None]*xyz[:,1]).sum(dim=0) / (mask[...,None].sum(dim=0) + 1e-5) # (3)
+    # Determine valid residues: those with all backbone atoms (N, CA, C) present
+    mask = mask_t[:,:3].all(dim=-1)  # Shape: (L,), True for valid residues
+
+    # Step 1: Center structure at origin using CA center of mass
+    center_CA = (mask[...,None]*xyz[:,1]).sum(dim=0) / (mask[...,None].sum(dim=0) + 1e-5)  # (3,)
     xyz = torch.where(mask.view(L,1,1), xyz - center_CA.view(1, 1, 3), xyz)
 
-    # move missing residues to the closest valid residues
-    exist_in_xyz = torch.where(mask)[0] # L_sub
-    seqmap = (torch.arange(L, device=xyz.device)[:,None] - exist_in_xyz[None,:]).abs() # (L, Lsub)
-    seqmap = torch.argmin(seqmap, dim=-1) # L
-    idx = torch.gather(exist_in_xyz, 0, seqmap)
+    # Step 2: Move missing residues to the position of their nearest valid residue
+    exist_in_xyz = torch.where(mask)[0]  # Indices of valid residues, shape (L_valid,)
+    # Compute distance in sequence space to all valid residues
+    seqmap = (torch.arange(L, device=xyz.device)[:,None] - exist_in_xyz[None,:]).abs()  # (L, L_valid)
+    seqmap = torch.argmin(seqmap, dim=-1)  # Index of nearest valid residue, shape (L,)
+    idx = torch.gather(exist_in_xyz, 0, seqmap)  # Map to actual residue index
+    # Get CA position of nearest valid residue for each residue
     offset_CA = torch.gather(xyz[:,1], 0, idx.reshape(L,1).expand(-1,3))
+    # Apply offset only to invalid residues
     xyz = torch.where(mask.view(L,1,1), xyz, xyz + offset_CA.reshape(L,1,3))
 
     return xyz
 
 def th_ang_v(ab,bc,eps:float=1e-8):
+    """
+    Compute bond angle from two vectors.
+
+    Calculates the angle between vectors ab and bc, returning both cosine and sine
+    components. This representation is useful for differentiable geometric calculations.
+
+    Args:
+        ab: First vector, shape (..., 3)
+        bc: Second vector, shape (..., 3)
+        eps: Small epsilon for numerical stability (default: 1e-8)
+
+    Returns:
+        Angle representation as (cos, sin) pairs, shape (..., 2)
+        First element is cos(angle), second is sin(angle)
+
+    Note:
+        Uses normalized vectors and clamps cosine to [-1, 1] for numerical stability.
+    """
     def th_norm(x,eps:float=1e-8):
+        """Compute L2 norm with numerical stability."""
         return x.square().sum(-1,keepdim=True).add(eps).sqrt()
+
     def th_N(x,alpha:float=0):
+        """Normalize vector."""
         return x/th_norm(x).add(alpha)
-    ab, bc = th_N(ab),th_N(bc)
-    cos_angle = torch.clamp( (ab*bc).sum(-1), -1, 1)
-    sin_angle = torch.sqrt(1-cos_angle.square() + eps)
+
+    # Normalize both vectors
+    ab, bc = th_N(ab), th_N(bc)
+
+    # Compute angle components
+    cos_angle = torch.clamp((ab*bc).sum(-1), -1, 1)  # Dot product gives cosine
+    sin_angle = torch.sqrt(1-cos_angle.square() + eps)  # Pythagorean identity
+
     dih = torch.stack((cos_angle,sin_angle),-1)
     return dih
 
 def th_dih_v(ab,bc,cd):
+    """
+    Compute dihedral angle from three consecutive bond vectors.
+
+    Calculates the dihedral (torsion) angle defined by four points connected by
+    vectors ab, bc, and cd. Returns (cos, sin) representation for differentiability.
+
+    The dihedral angle is computed using the normal vectors to the planes formed by
+    (ab, bc) and (bc, cd):
+        n1 = (ab × bc) / |ab × bc|
+        n2 = (bc × cd) / |bc × cd|
+        cos(angle) = n1 · n2
+        sin(angle) = (n1 × bc) · n2
+
+    Args:
+        ab: First bond vector (A to B), shape (..., 3)
+        bc: Second bond vector (B to C), shape (..., 3)
+        cd: Third bond vector (C to D), shape (..., 3)
+
+    Returns:
+        Dihedral angle as (cos, sin) pair, shape (..., 2)
+
+    Note:
+        All vectors are normalized before computation for numerical stability.
+    """
     def th_cross(a,b):
+        """Cross product with broadcasting."""
         a,b = torch.broadcast_tensors(a,b)
         return torch.cross(a,b, dim=-1)
+
     def th_norm(x,eps:float=1e-8):
+        """L2 norm with numerical stability."""
         return x.square().sum(-1,keepdim=True).add(eps).sqrt()
+
     def th_N(x,alpha:float=0):
+        """Normalize vector."""
         return x/th_norm(x).add(alpha)
 
-    ab, bc, cd = th_N(ab),th_N(bc),th_N(cd)
-    n1 = th_N( th_cross(ab,bc) )
-    n2 = th_N( th_cross(bc,cd) )
-    sin_angle = (th_cross(n1,bc)*n2).sum(-1)
-    cos_angle = (n1*n2).sum(-1)
+    # Normalize all bond vectors
+    ab, bc, cd = th_N(ab), th_N(bc), th_N(cd)
+
+    # Compute normal vectors to the two planes
+    n1 = th_N(th_cross(ab,bc))  # Normal to plane 1 (ab, bc)
+    n2 = th_N(th_cross(bc,cd))  # Normal to plane 2 (bc, cd)
+
+    # Compute dihedral angle components
+    sin_angle = (th_cross(n1,bc)*n2).sum(-1)  # Signed sine component
+    cos_angle = (n1*n2).sum(-1)                # Cosine component
+
     dih = torch.stack((cos_angle,sin_angle),-1)
     return dih
 
 def th_dih(a,b,c,d):
-    return th_dih_v(a-b,b-c,c-d)
+    """
+    Compute dihedral angle from four atom positions.
 
-# More complicated version splits error in CA-N and CA-C (giving more accurate CB position)
-# It returns the rigid transformation from local frame to global frame
+    Convenience wrapper for th_dih_v that computes bond vectors from atom positions.
+
+    Args:
+        a, b, c, d: Atom positions defining the dihedral angle, each shape (..., 3)
+
+    Returns:
+        Dihedral angle as (cos, sin) pair, shape (..., 2)
+
+    Note:
+        The dihedral is the angle around the b-c bond, viewed from b to c.
+    """
+    return th_dih_v(a-b, b-c, c-d)
+
 def rigid_from_3_points(N, Ca, C, non_ideal=False, eps=1e-8):
-    #N, Ca, C - [B,L, 3]
-    #R - [B,L, 3, 3], det(R)=1, inv(R) = R.T, R is a rotation matrix
+    """
+    Construct local coordinate frames from backbone N, CA, C atoms.
+
+    Builds a rigid transformation (rotation matrix + translation) for each residue
+    based on its backbone geometry. The frame is centered at CA with:
+        - e1 pointing along CA->C direction
+        - e2 in the peptide plane, perpendicular to e1
+        - e3 perpendicular to the peptide plane (e1 × e2)
+
+    This is the fundamental operation for converting between local and global coordinates
+    in protein structure generation.
+
+    Args:
+        N: N atom coordinates, shape (B, L, 3) where B is batch size, L is length
+        Ca: CA atom coordinates, shape (B, L, 3)
+        C: C atom coordinates, shape (B, L, 3)
+        non_ideal: If True, correct for non-ideal N-CA-C bond angles by applying
+                   a rotation to match the ideal angle (~111°). This splits the
+                   geometric error between CA-N and CA-C bonds, giving more accurate
+                   sidechain placement. (default: False)
+        eps: Small epsilon for numerical stability (default: 1e-8)
+
+    Returns:
+        R: Rotation matrices, shape (B, L, 3, 3)
+           These are proper rotation matrices with det(R) = 1 and inv(R) = R.T
+        Ca: Translation vectors (CA positions), shape (B, L, 3)
+
+    Note:
+        The non_ideal correction is particularly useful when building all-atom
+        structures from idealized backbone geometry, as it prevents accumulation
+        of geometric errors in the side chains.
+    """
     B,L = N.shape[:2]
-    
-    v1 = C-Ca
-    v2 = N-Ca
+
+    # Build orthonormal frame from backbone atoms
+    v1 = C-Ca   # Vector along CA-C bond
+    v2 = N-Ca   # Vector along CA-N bond
+
+    # e1: unit vector along CA-C
     e1 = v1/(torch.norm(v1, dim=-1, keepdim=True)+eps)
+
+    # e2: unit vector in peptide plane, perpendicular to e1
+    # Project v2 onto e1 and subtract to get perpendicular component
     u2 = v2-(torch.einsum('bli, bli -> bl', e1, v2)[...,None]*e1)
     e2 = u2/(torch.norm(u2, dim=-1, keepdim=True)+eps)
+
+    # e3: perpendicular to peptide plane
     e3 = torch.cross(e1, e2, dim=-1)
-    R = torch.cat([e1[...,None], e2[...,None], e3[...,None]], axis=-1) #[B,L,3,3] - rotation matrix
-    
+
+    # Assemble rotation matrix from basis vectors
+    R = torch.cat([e1[...,None], e2[...,None], e3[...,None]], axis=-1)  # Shape: (B, L, 3, 3)
+
+    # Apply correction for non-ideal bond angles if requested
     if non_ideal:
         v2 = v2/(torch.norm(v2, dim=-1, keepdim=True)+eps)
-        cosref = torch.sum(e1*v2, dim=-1) # cosine of current N-CA-C bond angle
-        costgt = cos_ideal_NCAC.item()
-        cos2del = torch.clamp( cosref*costgt + torch.sqrt((1-cosref*cosref)*(1-costgt*costgt)+eps), min=-1.0, max=1.0 )
+        cosref = torch.sum(e1*v2, dim=-1)  # Cosine of current N-CA-C bond angle
+        costgt = cos_ideal_NCAC.item()      # Cosine of ideal angle (~111°)
+
+        # Compute rotation angle to correct the bond angle
+        # Using half-angle formula: cos(2θ) = 2cos²(θ) - 1
+        cos2del = torch.clamp(
+            cosref*costgt + torch.sqrt((1-cosref*cosref)*(1-costgt*costgt)+eps),
+            min=-1.0, max=1.0
+        )
         cosdel = torch.sqrt(0.5*(1+cos2del)+eps)
         sindel = torch.sign(costgt-cosref) * torch.sqrt(1-0.5*(1+cos2del)+eps)
+
+        # Build rotation matrix to correct the angle
         Rp = torch.eye(3, device=N.device).repeat(B,L,1,1)
         Rp[:,:,0,0] = cosdel
         Rp[:,:,0,1] = -sindel
         Rp[:,:,1,0] = sindel
         Rp[:,:,1,1] = cosdel
-    
-        R = torch.einsum('blij,bljk->blik', R,Rp)
+
+        # Apply correction rotation
+        R = torch.einsum('blij,bljk->blik', R, Rp)
 
     return R, Ca
 
 def get_tor_mask(seq, torsion_indices, mask_in=None):
+    """
+    Generate mask for valid torsion angles in protein structures.
+
+    Creates a boolean mask indicating which torsion angles are defined/valid for
+    each residue. Handles:
+        - 10 torsion types: omega, phi, psi, chi1-4, CB-bend, CB-twist, CG-bend
+        - Amino acid specific constraints (e.g., GLY has no CB)
+        - Missing atom detection from input mask
+
+    Args:
+        seq: Amino acid sequence as indices, shape (B, L)
+        torsion_indices: Precomputed indices for torsion atoms, shape (22, 4, 4)
+        mask_in: Optional atom mask for missing atoms, shape (B, L, 27)
+
+    Returns:
+        Boolean mask for valid torsions, shape (B, L, 10)
+        Indices: [0:omega, 1:phi, 2:psi, 3-6:chi1-4, 7:CB-bend, 8:CB-twist, 9:CG-bend]
+    """
     B,L = seq.shape[:2]
     tors_mask = torch.ones((B,L,10), dtype=torch.bool, device=seq.device)
-    tors_mask[...,3:7] = torsion_indices[seq,:,-1] > 0
-    tors_mask[:,0,1] = False
-    tors_mask[:,-1,0] = False
 
-    # mask for additional angles
-    tors_mask[:,:,7] = seq!=aa2num['GLY']
-    tors_mask[:,:,8] = seq!=aa2num['GLY']
-    tors_mask[:,:,9] = torch.logical_and( seq!=aa2num['GLY'], seq!=aa2num['ALA'] )
-    tors_mask[:,:,9] = torch.logical_and( tors_mask[:,:,9], seq!=aa2num['UNK'] )
-    tors_mask[:,:,9] = torch.logical_and( tors_mask[:,:,9], seq!=aa2num['MAS'] )
+    # Chi angles (3-6): valid only if all 4 atoms defining the torsion exist
+    tors_mask[...,3:7] = torsion_indices[seq,:,-1] > 0
+
+    # Boundary conditions
+    tors_mask[:,0,1] = False   # No phi for first residue
+    tors_mask[:,-1,0] = False  # No omega for last residue
+
+    # Additional angle masks based on amino acid type
+    tors_mask[:,:,7] = seq!=aa2num['GLY']  # CB-bend: GLY has no CB
+    tors_mask[:,:,8] = seq!=aa2num['GLY']  # CB-twist: GLY has no CB
+    # CG-bend: need side chain beyond CB (not GLY, ALA, UNK, MAS)
+    tors_mask[:,:,9] = torch.logical_and(seq!=aa2num['GLY'], seq!=aa2num['ALA'])
+    tors_mask[:,:,9] = torch.logical_and(tors_mask[:,:,9], seq!=aa2num['UNK'])
+    tors_mask[:,:,9] = torch.logical_and(tors_mask[:,:,9], seq!=aa2num['MAS'])
 
     if mask_in != None:
-        # mask for missing atoms
-        # chis
+        # Further mask based on missing atoms
+        # Chi angles: require all 4 defining atoms present
         ti0 = torch.gather(mask_in,2,torsion_indices[seq,:,0])
         ti1 = torch.gather(mask_in,2,torsion_indices[seq,:,1])
         ti2 = torch.gather(mask_in,2,torsion_indices[seq,:,2])
         ti3 = torch.gather(mask_in,2,torsion_indices[seq,:,3])
         is_valid = torch.stack((ti0, ti1, ti2, ti3), dim=-2).all(dim=-1)
         tors_mask[...,3:7] = torch.logical_and(tors_mask[...,3:7], is_valid)
-        tors_mask[:,:,7] = torch.logical_and(tors_mask[:,:,7], mask_in[:,:,4]) # CB exist?
-        tors_mask[:,:,8] = torch.logical_and(tors_mask[:,:,8], mask_in[:,:,4]) # CB exist?
-        tors_mask[:,:,9] = torch.logical_and(tors_mask[:,:,9], mask_in[:,:,5]) # XG exist?
+
+        tors_mask[:,:,7] = torch.logical_and(tors_mask[:,:,7], mask_in[:,:,4])  # CB exists?
+        tors_mask[:,:,8] = torch.logical_and(tors_mask[:,:,8], mask_in[:,:,4])  # CB exists?
+        tors_mask[:,:,9] = torch.logical_and(tors_mask[:,:,9], mask_in[:,:,5])  # XG exists?
 
     return tors_mask
 
 def get_torsions(xyz_in, seq, torsion_indices, torsion_can_flip, ref_angles, mask_in=None):
+    """
+    Compute all torsion angles from atomic coordinates.
+
+    Calculates 10 types of torsion/angle descriptors for each residue:
+        - Backbone: omega (ω), phi (φ), psi (ψ)
+        - Side-chain: chi1-4 (χ1-χ4)
+        - Geometry: CB-bend, CB-twist, CG-bend
+
+    Before computing torsions, backbone atoms (N, CA, C) are idealized to standard
+    geometry to avoid numerical issues. Also generates "alternate" torsions for
+    symmetric side chains.
+
+    Args:
+        xyz_in: Atomic coordinates, shape (B, L, 27, 3)
+        seq: Amino acid sequence indices, shape (B, L)
+        torsion_indices: Atom indices for torsion calculation, shape (22, 4, 4)
+        torsion_can_flip: Boolean mask for flippable torsions, shape (22, 10)
+        ref_angles: Reference angles for geometric descriptors, shape (22, 3, 2)
+        mask_in: Optional atom mask, shape (B, L, 27)
+
+    Returns:
+        torsions: Torsion angles as (cos, sin) pairs, shape (B, L, 10, 2)
+        torsions_alt: Alternate torsions for symmetric side chains, shape (B, L, 10, 2)
+        tors_mask: Mask for valid torsions, shape (B, L, 10)
+        tors_planar: Mask for planar torsions (should be 0° or 180°), shape (B, L, 10)
+    """
     B,L = xyz_in.shape[:2]
-    
+
     tors_mask = get_tor_mask(seq, torsion_indices, mask_in)
     
     # torsions to restrain to 0 or 180degree
@@ -215,13 +466,37 @@ def get_torsions(xyz_in, seq, torsion_indices, torsion_can_flip, ref_angles, mas
 
     return torsions, torsions_alt, tors_mask, tors_planar
 
-# process ideal frames
+# Process ideal frames for kinematic structure building
 def make_frame(X, Y):
+    """
+    Construct orthonormal coordinate frame from two vectors.
+
+    Creates a right-handed orthonormal basis using Gram-Schmidt orthogonalization:
+        1. Normalize X to get first basis vector
+        2. Remove X component from Y and normalize to get second basis vector
+        3. Compute cross product to get third basis vector
+
+    Args:
+        X: First vector, shape (3,)
+        Y: Second vector (not necessarily orthogonal to X), shape (3,)
+
+    Returns:
+        Rotation matrix with columns [X_norm, Y_orth_norm, Z_norm], shape (3, 3)
+        Forms right-handed orthonormal coordinate system
+
+    Note:
+        Used for building local coordinate frames in kinematic chain calculations.
+    """
+    # Normalize X to get first basis vector
     Xn = X / torch.linalg.norm(X)
+
+    # Orthogonalize Y with respect to X (Gram-Schmidt)
     Y = Y - torch.dot(Y, Xn) * Xn
     Yn = Y / torch.linalg.norm(Y)
-    Z = torch.cross(Xn,Yn)
-    Zn =  Z / torch.linalg.norm(Z)
+
+    # Compute third basis vector via cross product
+    Z = torch.cross(Xn, Yn)
+    Zn = Z / torch.linalg.norm(Z)
 
     return torch.stack((Xn,Yn,Zn), dim=-1)
 
@@ -236,8 +511,30 @@ def cross_product_matrix(u):
     matrix[:,:,2,1] = u[...,0]
     return matrix
 
-# writepdb
+# PDB file writing utilities
 def writepdb(filename, atoms, seq, binderlen=None, idx_pdb=None, bfacts=None, chain_idx=None):
+    """
+    Write protein structure to PDB file.
+
+    Supports multiple representations:
+        - CA-only (atoms shape: L x 3)
+        - Backbone (N, CA, C): (L x 3 x 3)
+        - Backbone + O: (L x 4 x 3)
+        - Full atom: (L x 14 x 3) or (L x 27 x 3)
+
+    Args:
+        filename: Output PDB filename
+        atoms: Atomic coordinates, shape (L, [3|3|4|14|27], 3)
+        seq: Amino acid sequence as indices, shape (L,)
+        binderlen: Optional length of binder chain for multi-chain output
+        idx_pdb: Optional custom residue numbering, shape (L,)
+        bfacts: Optional B-factors (temperature factors), shape (L,)
+        chain_idx: Optional chain identifiers for each residue, shape (L,)
+
+    Note:
+        If binderlen is provided, residues 0:binderlen are chain A, rest are chain B.
+        Handles histidine protonation state automatically.
+    """
     f = open(filename,"w")
     ctr = 1
     scpu = seq.cpu().squeeze()
