@@ -1,3 +1,10 @@
+"""
+Protein Structure Scoring Functions
+
+This module provides scoring functions for evaluating protein structures,
+including Rosetta-based energy functions and structure quality metrics.
+"""
+
 
 ##
 ## lk and lk term

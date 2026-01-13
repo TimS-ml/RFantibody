@@ -1,4 +1,23 @@
-"""SO(3) diffusion methods."""
+"""
+SO(3) diffusion methods for rotational alignment.
+
+This module implements the Isotropic Gaussian distribution on SO(3) (IGSO3),
+which is used for diffusion models on 3D rotations. This is essential for
+modeling protein backbone geometry where rotations are a key degree of freedom.
+
+Based on:
+    "Denoising Diffusion Probabilistic Models on SO(3) for Rotational Alignment"
+    Leach et al. 2022
+
+Key concepts:
+    - IGSO(3): Isotropic Gaussian distribution on the rotation group SO(3)
+    - Score functions: Gradients of the log-density for denoising
+    - Truncated expansions: Efficient approximation of infinite series
+
+The parameterization here uses sigma = sqrt(2) * eps, where eps is the scale
+parameter from Leach et al., ensuring agreement with Brownian motion on SO(3)
+with time t = sigma^2.
+"""
 import torch
 import numpy as np
 

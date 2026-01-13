@@ -1,3 +1,10 @@
+"""
+Diffusion Utilities
+
+Helper functions for the diffusion process in structure generation,
+including noise scheduling, timestep handling, and sampling utilities.
+"""
+
 import torch 
 import numpy as np 
 import random 

@@ -1,3 +1,15 @@
+"""
+3D Rotation Representation Conversions
+
+Utilities for converting between different representations of 3D rotations:
+- Rotation matrices
+- Quaternions
+- Euler angles
+- Axis-angle representations
+
+These conversions are essential for manipulating protein backbone geometry.
+"""
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #

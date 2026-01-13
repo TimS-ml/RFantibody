@@ -1,3 +1,10 @@
+"""
+Diffusion Model Core Implementation
+
+Main diffusion process implementation for protein structure generation.
+Handles forward noising process and reverse denoising for structure generation.
+"""
+
 # script for diffusion protocols 
 import torch 
 import pickle
